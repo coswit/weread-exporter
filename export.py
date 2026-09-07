@@ -617,28 +617,75 @@ def _save_empty_chapter(ch_title, catalog_idx, md_dir, raw_dir, name_map):
     print(f"  [{catalog_idx:4d}] {ch_title[:36]:36s}      0字 [无可捕获内容, 记为空章]")
 
 
+def prev_last_paragraph(raw_dir, md_dir, start_idx):
+    """读取 start_idx-1 章落盘 md 的最后一个纯文字段落, 供跨界去重;取不到返回空串。"""
+    if start_idx < 2:
+        return ""
+    raw_path = os.path.join(raw_dir, f"{start_idx - 1:04d}.json")
+    try:
+        with open(raw_path, encoding="utf-8") as f:
+            fname = json.load(f).get("file", "")
+    except Exception:
+        return ""
+    md_path = os.path.join(md_dir, fname)
+    if not fname or not os.path.exists(md_path):
+        return ""
+    try:
+        with open(md_path, encoding="utf-8") as f:
+            paras = [p.strip() for p in f.read().split("\n\n") if p.strip()]
+    except Exception:
+        return ""
+    for p in reversed(paras):
+        if not p.startswith("#") and not p.startswith("!["):
+            return p
+    return ""
+
+
+def drop_overlap_blocks(blocks, prev_last_para):
+    """跳转落地页与前章末页跨界的文字去重: 丢弃开头连续文字块, 只要其累加文本
+    是前一章最后段落的后缀(落地页左半渲染的是前章尾部)。返回丢弃的块数。"""
+    if not prev_last_para:
+        return 0
+    committed = 0
+    acc = ""
+    n = 0
+    while n < len(blocks) and blocks[n]["type"] == "text":
+        cand = acc + blocks[n]["text"]
+        if prev_last_para.endswith(cand):
+            committed = n + 1  # 累加文本构成前章末段后缀, 确认丢弃
+            acc = cand
+            n += 1
+        elif cand in prev_last_para:
+            # 中间累加未必恰好是后缀, 但仍是潜在跨界内容, 暂记继续观察
+            acc = cand
+            n += 1
+        else:
+            break
+    del blocks[:committed]
+    return committed
+
+
 async def export_segment(page, seg, titles, selected, md_dir, raw_dir, name_map, seen_imgs):
     """导出一个连续章节段 seg(1-based 目录编号列表)。返回 (保存章数, 结束原因)。"""
     start, end = seg[0], seg[-1]
     print(f"  ▶ 段 {start}-{end}: 跳到「{titles[start - 1]}」")
     await jump_to_chapter(page, start, titles)
 
-    cur_title = await header_title(page)
-    m = match_catalog_title(titles, cur_title, start - 1)
-    if m is None:
-        print(f"  ⚠️  跳转后标题「{cur_title}」与目录第 {start} 章不符, 按该章继续")
-        cur_pos = start
-    else:
-        if m > start:
-            if m - start > 3:
-                raise RuntimeError(
-                    f"跳转落点第 {m} 章与目标第 {start} 章相差过大, 判定跳转失败")
-            # 阅读器跳过封面/扉页等无正文页: 被跳过的选中章记为空章, 防续传死循环
-            for skipped in range(start, m):
-                if skipped in selected:
-                    _save_empty_chapter(titles[skipped - 1], skipped,
-                                        md_dir, raw_dir, name_map)
+    cur_pos = start
+    cur_title = titles[start - 1]
+    h = await header_title(page)
+    m = match_catalog_title(titles, h, start - 1) if h else None
+    if m is not None and m > start:
+        if m - start > 3:
+            raise RuntimeError(f"跳转落点第 {m} 章与目标第 {start} 章相差过大, 判定跳转失败")
+        # 阅读器跳过封面/扉页等无正文页: 被跳过的选中章记为空章, 防续传死循环
+        for skipped in range(start, m):
+            if skipped in selected:
+                _save_empty_chapter(titles[skipped - 1], skipped, md_dir, raw_dir, name_map)
         cur_pos = m
+        cur_title = titles[m - 1]
+    elif m is None and h:
+        print(f"  ℹ️  跳转后顶部标题暂为「{h}」(未及更新), 以目录第 {start} 章为准")
     blocks = []
     warned = set()
     saved = [0]
@@ -673,6 +720,9 @@ async def export_segment(page, seg, titles, selected, md_dir, raw_dir, name_map,
     await page.evaluate("() => window.__wr_reset()")
     await wait_render_stable(page)
     await capture_once()
+    dropped = drop_overlap_blocks(blocks, prev_last_paragraph(raw_dir, md_dir, start))
+    if dropped:
+        print(f"  ℹ️  跨界去重: 丢弃与前章末页重复的 {dropped} 行")
 
     stale = 0
     try:

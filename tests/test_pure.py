@@ -190,3 +190,45 @@ class TestRemainingWork:
         (raw / "old.json").write_text(
             json.dumps({"title": "旧版无 catalog_idx"}), encoding="utf-8")
         assert remaining_work({1, 2, 3, 4}, str(raw)) == {2, 3, 4}
+
+
+from export import drop_overlap_blocks, prev_last_paragraph  # noqa: E402
+
+
+class TestDropOverlapBlocks:
+    def test_drops_suffix_lines(self):
+        blocks = [{"type": "text", "text": "前章末行一"},
+                  {"type": "text", "text": "前章末行二"},
+                  {"type": "text", "text": "本章新内容"}]
+        n = drop_overlap_blocks(blocks, "更早的内容前章末行一前章末行二")
+        assert n == 2
+        assert [b["text"] for b in blocks] == ["本章新内容"]
+
+    def test_stops_at_image(self):
+        blocks = [{"type": "img", "src": "u", "w": 1, "h": 1},
+                  {"type": "text", "text": "前章末行"}]
+        assert drop_overlap_blocks(blocks, "xx前章末行") == 0
+
+    def test_no_overlap_untouched(self):
+        blocks = [{"type": "text", "text": "完全不同的开头"}]
+        assert drop_overlap_blocks(blocks, "另一个段落") == 0
+        assert len(blocks) == 1
+
+    def test_empty_prev(self):
+        blocks = [{"type": "text", "text": "x"}]
+        assert drop_overlap_blocks(blocks, "") == 0
+
+
+class TestPrevLastParagraph:
+    def test_reads_last_text_para(self, tmp_path):
+        raw, md = tmp_path / "raw", tmp_path / "chapters"
+        raw.mkdir(); md.mkdir()
+        (raw / "0005.json").write_text(
+            json.dumps({"file": "第5章.md"}), encoding="utf-8")
+        (md / "第5章.md").write_text(
+            "# 第5章\n\n开头段。\n\n![图](images/a.jpg)\n\n结尾段落。", encoding="utf-8")
+        assert prev_last_paragraph(str(raw), str(md), 6) == "结尾段落。"
+
+    def test_missing_returns_empty(self, tmp_path):
+        assert prev_last_paragraph(str(tmp_path / "raw"), str(tmp_path / "md"), 6) == ""
+        assert prev_last_paragraph(str(tmp_path), str(tmp_path), 1) == ""
