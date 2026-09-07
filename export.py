@@ -258,7 +258,7 @@ def render_chapter_md(ch_title, blocks, ch_idx):
             flush_para()
             img_seq += 1
             fname = img_filename(b["src"], ch_idx, img_seq)
-            out.append(f"![图](images/{fname})")
+            out.append(f"![图](./images/{fname})")
             img_records.append({"url": b["src"], "file": fname})
     flush_para()
 
@@ -977,7 +977,8 @@ def download_all_images(raw_dir, img_dir, workers=8):
 
 
 def merge_chapters(book_title, book_author, book_dir, md_dir, raw_dir):
-    """按目录序合并选中章节(新格式 raw)为 书名.md, 写在书目录内使 images/ 相对路径可用。"""
+    """按目录序合并选中章节(新格式 raw)为 书名.md, 写在书目录内。
+    章节 md 引用 ./images/, 合并文件在上一级, 改写为 ./chapters/images/。"""
     recs = []
     if os.path.isdir(raw_dir):
         for jf in os.listdir(raw_dir):
@@ -997,7 +998,10 @@ def merge_chapters(book_title, book_author, book_dir, md_dir, raw_dir):
             md = os.path.join(md_dir, r.get("file", ""))
             if os.path.exists(md):
                 with open(md, encoding="utf-8") as f:
-                    out.write(f.read())
+                    body = f.read()
+                # 章节 md 里的 ./images/ 或旧版 images/ → 相对合并文件的路径
+                body = re.sub(r"\]\((\./)?images/", "](./chapters/images/", body)
+                out.write(body)
                 out.write("\n\n---\n\n")
     os.replace(out_path + ".tmp", out_path)
     print(f"  📦 合并 {len(recs)} 章 → {out_path}")
@@ -1035,7 +1039,7 @@ async def main(argv=None):
     book_dir = os.path.join("output", book_id)
     md_dir = os.path.join(book_dir, "chapters")
     raw_dir = os.path.join(book_dir, "raw")
-    img_dir = os.path.join(book_dir, "images")
+    img_dir = os.path.join(md_dir, "images")  # 放 chapters/ 内, 章节 md 用 ./images/ 直接触达
     for d in (md_dir, raw_dir, img_dir):
         os.makedirs(d, exist_ok=True)
     catalog_path = os.path.join(book_dir, "_catalog.json")

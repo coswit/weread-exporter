@@ -138,7 +138,7 @@ class TestRenderChapterMd:
                   {"type": "img", "src": "http://x/a.jpg", "w": 1, "h": 1},
                   {"type": "text", "text": "段落二。"}]
         body, imgs = render_chapter_md("t", blocks, 3)
-        assert "![图](images/ch0003_img01.jpg)" in body
+        assert "![图](./images/ch0003_img01.jpg)" in body
         assert imgs == [{"url": "http://x/a.jpg", "file": "ch0003_img01.jpg"}]
 
     def test_title_line_not_repeated_in_body(self):

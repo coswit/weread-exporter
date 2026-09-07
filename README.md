@@ -48,10 +48,11 @@ python export.py <book_id> --download-only
 output/<book_id>/
 ├── _catalog.json        # 目录标题数组(位置即编号)
 ├── _selection.json      # 上次选章与书名(续传/合并用)
-├── chapters/第1章 xxx.md       # 章节按标题命名(重复标题自动加 (2))
-├── images/              # chXXXX_imgNN.jpg 并发下载
+├── chapters/
+│   ├── 第1章 xxx.md     # 章节按标题命名(重复标题自动加 (2))
+│   └── images/          # chXXXX_imgNN.jpg 并发下载, 章节 md 以 ./images/ 引用
 ├── raw/                 # 每章元数据(catalog_idx/finished/图片URL)
-└── 书名.md              # 选中章节按目录序合并
+└── 书名.md              # 选中章节按目录序合并(图片引用 ./chapters/images/)
 ```
 
 > v3 旧版导出目录(数字命名 md)与新格式不互通:旧 raw 无 `catalog_idx` 会被忽略,建议旧目录改名备份后重新导出。
