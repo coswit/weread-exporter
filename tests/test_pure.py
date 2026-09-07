@@ -92,7 +92,8 @@ class TestMatchCatalogTitle:
 
 
 from export import (split_spread, chars_to_lines, render_chapter_md,
-                    MEASURE_RE, SENTENCE_END)  # noqa: E402
+                    build_page_blocks, md_code_block, is_measure_text,
+                    SENTENCE_END)  # noqa: E402
 
 
 def _ch(t, x, y):
@@ -118,8 +119,18 @@ class TestCharsToLines:
         lines = chars_to_lines(chars)
         assert [l["text"] for l in lines] == ["世界", "好人"]
 
-    def test_measure_only_dropped(self):
-        assert chars_to_lines([_ch(" .,1", 1, 10)]) == []
+    def test_repeated_char_measure_dropped(self):
+        # 同一字符重复的测量串丢弃; 真实英文/数字片段保留
+        lines = chars_to_lines([_ch("MMMM", 1, 10), _ch("ti", 5, 10)])
+        assert [l["text"] for l in lines] == ["ti"]
+
+    def test_is_measure_text(self):
+        assert is_measure_text("MMMM")
+        assert is_measure_text("....")
+        assert not is_measure_text("ti")
+        assert not is_measure_text("Activity")
+        assert not is_measure_text("2011")
+        assert not is_measure_text("M")
 
 
 class TestRenderChapterMd:
@@ -270,3 +281,31 @@ class TestTrimToHeading:
     def test_no_match_no_trim(self):
         blocks = [{"type": "text", "text": "正文"}]
         assert trim_to_heading(blocks, "不存在的标题") == 0
+
+
+class TestCodeBlocks:
+    def test_build_interleaves_and_dedups_code(self):
+        chars = [_ch("前", 10, 100), _ch("文", 20, 100), _ch("后", 10, 500), _ch("文", 20, 500)]
+        pres = [{"text": "int a = 1;\n", "top": 200, "left": 100},
+                {"text": "int a = 1;\n", "top": 220, "left": 306}]  # 双份渲染
+        blocks = build_page_blocks(chars, [], [], set(), pres, set())
+        kinds = [(b["type"], b.get("text")) for b in blocks]
+        assert kinds == [("text", "前文"), ("code", "int a = 1;"), ("text", "后文")]
+
+    def test_code_no_pre_arg_unchanged(self):
+        chars = [_ch("字", 10, 100)]
+        blocks = build_page_blocks(chars, [], [], set())
+        assert blocks == [{"type": "text", "text": "字"}]
+
+    def test_render_code_block(self):
+        blocks = [{"type": "text", "text": "代码如下："},
+                  {"type": "code", "text": "int a = 1;\nint b = 2;\n"},
+                  {"type": "text", "text": "说明。"}]
+        body, imgs = render_chapter_md("章", blocks, 1)
+        assert "```\nint a = 1;\nint b = 2;\n```" in body
+        assert "代码如下：" in body and "说明。" in body
+        assert imgs == []
+
+    def test_md_code_block_fence_escaping(self):
+        out = md_code_block("x = `a`\n```\ny\n")
+        assert out == "````\nx = `a`\n```\ny\n````"

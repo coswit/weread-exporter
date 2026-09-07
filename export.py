@@ -141,7 +141,32 @@ CANVAS_RECTS_JS = """
 }).filter(r => r.h > 300)
 """
 
-MEASURE_RE = re.compile(r'^[a-zA-Z0-9`~!@#$%^&*()\-_=+\[\]{}|;:\',<.>/?\\"\s]+$')
+# 当前视口内可见的代码块(DOM <pre>, 带屏幕坐标; 微信读书的代码不走 Canvas 渲染)
+VIEWPORT_PRE_JS = """
+() => {
+    const H = window.innerHeight, W = window.innerWidth, out = [];
+    document.querySelectorAll('pre').forEach(p => {
+        const text = (p.textContent || '');
+        if (!text.trim()) return;
+        const r = p.getBoundingClientRect();
+        if (r.width > 40 && r.height > 15 && r.bottom > 0 && r.top < H &&
+            r.right > 0 && r.left < W &&
+            getComputedStyle(p).visibility !== 'hidden' &&
+            getComputedStyle(p).display !== 'none') {
+            out.push({text: text, top: Math.round(r.top), left: Math.round(r.left)});
+        }
+    });
+    return out;
+}
+"""
+
+REPEAT_RE = re.compile(r"(.)\1+")
+
+
+def is_measure_text(t):
+    """疑似排版测量串：2 字符以上且全为同一字符(如 MMMM)。
+    真实的英文单词/数字片段(如 ti、Activity、2011)是正常 fillText 内容，保留。"""
+    return len(t) > 1 and REPEAT_RE.fullmatch(t) is not None
 SENTENCE_END = set("。！？；：」）】》…—")
 
 
@@ -160,7 +185,7 @@ def split_spread(chars):
 
 def chars_to_lines(chars):
     """把单页字符按 y 分行，返回 [{y, text}]（未合并段落）"""
-    real = [c for c in chars if len(c["t"]) == 1 or not MEASURE_RE.match(c["t"])]
+    real = [c for c in chars if len(c["t"]) == 1 or not is_measure_text(c["t"])]
     if not real:
         return []
     rows = {}
@@ -175,11 +200,15 @@ def chars_to_lines(chars):
     return lines
 
 
-def build_page_blocks(chars, images, canvas_rects, seen_imgs):
-    """把一次渲染(可能双页)拆成有序块列表: [{type:'text'/'img', ...}]
-       文字行和图片按屏幕 y 交错；左页整页在前，右页在后。"""
+def build_page_blocks(chars, images, canvas_rects, seen_imgs, pres=None, seen_codes=None):
+    """把一次渲染(可能双页)拆成有序块列表: [{type:'text'/'img'/'code', ...}]
+       文字行、图片、代码块按屏幕 y 交错；左页整页在前，右页在后。
+       pres: 视口内 <pre> 代码块 [{text, top, left}]; seen_codes 按内容去重
+       (同一代码块会被双份渲染/跨页重复捕获)。"""
     blocks = []
     pages = split_spread(chars)
+    if seen_codes is None:
+        seen_codes = set()
 
     # 判定左右 canvas
     rects = sorted(canvas_rects, key=lambda r: r["left"])
@@ -187,11 +216,13 @@ def build_page_blocks(chars, images, canvas_rects, seen_imgs):
     right_rect = rects[1] if len(rects) > 1 else left_rect
     mid_x = (left_rect["left"] + right_rect["left"]) / 2 + 180 if len(rects) > 1 else 99999
 
-    # 图片按左右分组
+    # 图片/代码块按左右分组
     left_imgs = [im for im in images if im["left"] < mid_x]
     right_imgs = [im for im in images if im["left"] >= mid_x]
+    left_codes = [pr for pr in (pres or []) if pr["left"] < mid_x]
+    right_codes = [pr for pr in (pres or []) if pr["left"] >= mid_x]
 
-    def emit_page(page_chars, page_rect, page_imgs):
+    def emit_page(page_chars, page_rect, page_imgs, page_codes):
         lines = chars_to_lines(page_chars)
         items = []
         for ln in lines:
@@ -199,22 +230,30 @@ def build_page_blocks(chars, images, canvas_rects, seen_imgs):
         for im in page_imgs:
             if im["src"] in seen_imgs:
                 continue
+            seen_imgs.add(im["src"])  # 收集时即登记, 同页重复渲染只取一份
             items.append(("img", im["top"], im))
+        for pr in page_codes:
+            key = pr["text"].rstrip()
+            if not key or key in seen_codes:
+                continue
+            seen_codes.add(key)
+            items.append(("code", pr["top"], key))
         items.sort(key=lambda t: t[1])
         for typ, _y, payload in items:
             if typ == "text":
                 blocks.append({"type": "text", "text": payload})
+            elif typ == "code":
+                blocks.append({"type": "code", "text": payload})
             else:
-                seen_imgs.add(payload["src"])
                 blocks.append({"type": "img", "src": payload["src"],
                                 "w": payload["w"], "h": payload["h"]})
 
     if len(pages) == 2:
-        emit_page(pages[0], left_rect, left_imgs)
-        emit_page(pages[1], right_rect, right_imgs)
+        emit_page(pages[0], left_rect, left_imgs, left_codes)
+        emit_page(pages[1], right_rect, right_imgs, right_codes)
     else:
-        # 单页：图片全归这页，仍按 y 排
-        emit_page(pages[0], left_rect, left_imgs + right_imgs)
+        # 单页：图片/代码全归这页，仍按 y 排
+        emit_page(pages[0], left_rect, left_imgs + right_imgs, left_codes + right_codes)
     return blocks
 
 
@@ -226,8 +265,16 @@ def img_filename(url, ch_idx, seq):
     return f"ch{ch_idx:04d}_img{seq:02d}.{ext}"
 
 
+def md_code_block(text):
+    """代码文本 → Markdown 围栏块；正文含 ``` 时自动加长围栏。"""
+    fence = "```"
+    while fence in text:
+        fence += "`"
+    return f"{fence}\n{text.rstrip()}\n{fence}"
+
+
 def render_chapter_md(ch_title, blocks, ch_idx):
-    """把有序块渲染成 Markdown：文字行合并成段落，图片就地插入"""
+    """把有序块渲染成 Markdown：文字行合并成段落，图片/代码块就地插入"""
     out = [f"# {ch_title}\n"]
     para = []
     img_records = []
@@ -254,6 +301,9 @@ def render_chapter_md(ch_title, blocks, ch_idx):
     for b in blocks:
         if b["type"] == "text":
             para.append(b["text"])
+        elif b["type"] == "code":
+            flush_para()
+            out.append(md_code_block(b["text"]))
         else:
             flush_para()
             img_seq += 1
@@ -585,7 +635,8 @@ def save_chapter(ch_title, blocks, catalog_idx, md_dir, raw_dir, name_map, finis
     """按标题命名落盘一章:chapters/<标题>.md + raw/<idx>.json(原子写)。"""
     body, img_records = render_chapter_md(ch_title, blocks, catalog_idx)
     text_len = sum(len(b["text"]) for b in blocks if b["type"] == "text")
-    if text_len == 0 and not img_records:
+    code_len = sum(len(b["text"]) for b in blocks if b["type"] == "code")
+    if text_len == 0 and code_len == 0 and not img_records:
         return 0, []
     fname = name_map[catalog_idx - 1] + ".md"
     md_path = os.path.join(md_dir, fname)
@@ -593,12 +644,13 @@ def save_chapter(ch_title, blocks, catalog_idx, md_dir, raw_dir, name_map, finis
         f.write(body)
     os.replace(md_path + ".tmp", md_path)
     rec = {"title": ch_title, "catalog_idx": catalog_idx, "file": fname,
-           "images": img_records, "text_len": text_len, "finished": finished}
+           "images": img_records, "text_len": text_len, "code_len": code_len,
+           "finished": finished}
     raw_path = os.path.join(raw_dir, f"{catalog_idx:04d}.json")
     with open(raw_path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(rec, f, ensure_ascii=False)
     os.replace(raw_path + ".tmp", raw_path)
-    return text_len, img_records
+    return text_len, code_len, img_records
 
 
 def _save_empty_chapter(ch_title, catalog_idx, md_dir, raw_dir, name_map):
@@ -696,7 +748,8 @@ def trim_to_heading(blocks, title):
     return 0
 
 
-async def export_segment(page, seg, titles, selected, md_dir, raw_dir, name_map, seen_imgs):
+async def export_segment(page, seg, titles, selected, md_dir, raw_dir, name_map, seen_imgs,
+                         seen_codes):
     """导出一个连续章节段 seg(1-based 目录编号列表)。返回 (保存章数, 结束原因)。"""
     start, end = seg[0], seg[-1]
     print(f"  ▶ 段 {start}-{end}: 跳到「{titles[start - 1]}」")
@@ -724,12 +777,13 @@ async def export_segment(page, seg, titles, selected, md_dir, raw_dir, name_map,
     def save_and_clear(note="", finished=True):
         if not blocks:
             return
-        n, imgs = save_chapter(cur_title, blocks, cur_pos, md_dir, raw_dir,
-                               name_map, finished=finished)
-        if n or imgs:
+        n, c, imgs = save_chapter(cur_title, blocks, cur_pos, md_dir, raw_dir,
+                                  name_map, finished=finished)
+        if n or c or imgs:
             saved[0] += 1
             img_note = f" +{len(imgs)}图" if imgs else ""
-            print(f"  [{cur_pos:4d}] {cur_title[:36]:36s} {n:6d}字{img_note}{note}")
+            code_note = f" +{c}码" if c else ""
+            print(f"  [{cur_pos:4d}] {cur_title[:36]:36s} {n:6d}字{code_note}{img_note}{note}")
         blocks.clear()
 
     async def capture_once():
@@ -738,9 +792,10 @@ async def export_segment(page, seg, titles, selected, md_dir, raw_dir, name_map,
         chars = await page.evaluate("() => window.__wr_chars")
         rects = await page.evaluate(CANVAS_RECTS_JS)
         imgs = await page.evaluate(VIEWPORT_IMGS_JS)
+        pres = await page.evaluate(VIEWPORT_PRE_JS)
         added = 0
         cut = False
-        for b in build_page_blocks(chars, imgs, rects, seen_imgs):
+        for b in build_page_blocks(chars, imgs, rects, seen_imgs, pres, seen_codes):
             if (b["type"] == "text" and blocks
                     and blocks[-1].get("type") == "text"
                     and blocks[-1]["text"] == b["text"]):
@@ -832,6 +887,7 @@ async def run_session(book_id, md_dir, raw_dir, catalog, selected, name_map, see
         res["completed"] = True
         return res
     purge_stale_chapters(raw_dir, md_dir, remaining, seen_imgs)
+    seen_codes = set()  # 代码块按内容去重(双份渲染/跨页可见), 会话内共享
     try:
         async with reader_session(book_id) as page:
             res["book_title"], res["book_author"] = await fetch_book_title(page)
@@ -843,7 +899,8 @@ async def run_session(book_id, md_dir, raw_dir, catalog, selected, name_map, see
             print(f"  剩余 {len(remaining)} 章, 分 {len(segments)} 段: {preview}")
             for seg in segments:
                 n, reason = await export_segment(
-                    page, seg, catalog, selected, md_dir, raw_dir, name_map, seen_imgs)
+                    page, seg, catalog, selected, md_dir, raw_dir, name_map,
+                    seen_imgs, seen_codes)
                 print(f"  ✔ 段 {seg[0]}-{seg[-1]}: {n} 章 ({reason})")
             res["completed"] = not remaining_work(selected, raw_dir)
     except Exception as e:
