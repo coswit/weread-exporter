@@ -601,6 +601,22 @@ def save_chapter(ch_title, blocks, catalog_idx, md_dir, raw_dir, name_map, finis
     return text_len, img_records
 
 
+def _save_empty_chapter(ch_title, catalog_idx, md_dir, raw_dir, name_map):
+    """无任何可捕获内容的章节(如纯封面扉页): 记空章为 finished, 防续传死循环。"""
+    fname = name_map[catalog_idx - 1] + ".md"
+    md_path = os.path.join(md_dir, fname)
+    with open(md_path + ".tmp", "w", encoding="utf-8") as f:
+        f.write(f"# {ch_title}\n")
+    os.replace(md_path + ".tmp", md_path)
+    rec = {"title": ch_title, "catalog_idx": catalog_idx, "file": fname,
+           "images": [], "text_len": 0, "finished": True}
+    raw_path = os.path.join(raw_dir, f"{catalog_idx:04d}.json")
+    with open(raw_path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(rec, f, ensure_ascii=False)
+    os.replace(raw_path + ".tmp", raw_path)
+    print(f"  [{catalog_idx:4d}] {ch_title[:36]:36s}      0字 [无可捕获内容, 记为空章]")
+
+
 async def export_segment(page, seg, titles, selected, md_dir, raw_dir, name_map, seen_imgs):
     """导出一个连续章节段 seg(1-based 目录编号列表)。返回 (保存章数, 结束原因)。"""
     start, end = seg[0], seg[-1]
@@ -613,6 +629,15 @@ async def export_segment(page, seg, titles, selected, md_dir, raw_dir, name_map,
         print(f"  ⚠️  跳转后标题「{cur_title}」与目录第 {start} 章不符, 按该章继续")
         cur_pos = start
     else:
+        if m > start:
+            if m - start > 3:
+                raise RuntimeError(
+                    f"跳转落点第 {m} 章与目标第 {start} 章相差过大, 判定跳转失败")
+            # 阅读器跳过封面/扉页等无正文页: 被跳过的选中章记为空章, 防续传死循环
+            for skipped in range(start, m):
+                if skipped in selected:
+                    _save_empty_chapter(titles[skipped - 1], skipped,
+                                        md_dir, raw_dir, name_map)
         cur_pos = m
     blocks = []
     warned = set()
@@ -665,6 +690,8 @@ async def export_segment(page, seg, titles, selected, md_dir, raw_dir, name_map,
                         print(f"  ⚠️  顶部标题「{new_title}」在目录中定位不到, 按同章继续")
                         warned.add(new_title)
                 else:
+                    if not blocks and cur_pos in selected:
+                        _save_empty_chapter(cur_title, cur_pos, md_dir, raw_dir, name_map)
                     save_and_clear()
                     if m > end or m not in selected:
                         return saved[0], "segment_end"
@@ -716,6 +743,157 @@ async def run_session(book_id, md_dir, raw_dir, catalog, selected, name_map, see
     return res
 
 
+# ---------- 收尾层:选择持久化 / 图片下载 / 合并 ----------
+
+def load_catalog(path):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) and data else None
+    except Exception:
+        return None
+
+
+def save_selection(path, selected, book_title="", book_author=""):
+    rec = {"selected": sorted(selected), "book_title": book_title,
+           "book_author": book_author}
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(rec, f, ensure_ascii=False)
+    os.replace(path + ".tmp", path)
+
+
+def load_selection(path):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def prompt_selection(catalog):
+    for i, t in enumerate(catalog, 1):
+        print(f"  [{i:4d}] {t}")
+    while True:
+        raw = input(f"\n要导出哪些章节? (共 {len(catalog)} 章, 如 5-12,18, 回车=全部): ").strip()
+        if not raw or raw.lower() == "all":
+            return set(range(1, len(catalog) + 1))
+        sel = parse_chapter_spec(raw, len(catalog))
+        if sel:
+            return sel
+        print("  输入无法解析出任何有效章节, 请重试")
+
+
+def resolve_selection(spec, selection_path, catalog):
+    if spec:
+        sel = parse_chapter_spec(spec, len(catalog))
+        if not sel:
+            sys.exit("❌ --chapters 未解析出任何有效章节")
+        return sel
+    data = load_selection(selection_path)
+    if data and data.get("selected"):
+        valid = {i for i in data["selected"] if isinstance(i, int) and 1 <= i <= len(catalog)}
+        if valid:
+            print(f"  沿用上次选择: {len(valid)} 章 (改选用 --chapters 重新指定)")
+            return valid
+    return prompt_selection(catalog)
+
+
+# 强制 IPv4(macOS/部分网络下 IPv6 路由不通会导致每张图卡 ~120s)
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _force_ipv4(*a, **k):
+    return [x for x in _orig_getaddrinfo(*a, **k) if x[0] == socket.AF_INET]
+
+
+socket.getaddrinfo = _force_ipv4
+
+_DL_HEADERS = {"Referer": "https://weread.qq.com/", "User-Agent": "Mozilla/5.0"}
+
+
+def _download_one(url, fpath, retries=3):
+    if os.path.exists(fpath) and os.path.getsize(fpath) > 1000:
+        return "skip"
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers=_DL_HEADERS)
+            raw = urllib.request.urlopen(req, timeout=20).read()
+            if len(raw) > 500:
+                with open(fpath, "wb") as f:
+                    f.write(raw)
+                return "ok"
+        except Exception as e:
+            if attempt == retries - 1:
+                return f"fail:{e}"
+            time.sleep(1.5)
+    return "fail:empty"
+
+
+def download_all_images(raw_dir, img_dir, workers=8):
+    os.makedirs(img_dir, exist_ok=True)
+    tasks = []
+    if os.path.isdir(raw_dir):
+        for jf in sorted(os.listdir(raw_dir)):
+            if jf.endswith(".json"):
+                try:
+                    with open(os.path.join(raw_dir, jf), encoding="utf-8") as f:
+                        recs = json.load(f).get("images", [])
+                except Exception:
+                    continue
+                for im in recs:
+                    tasks.append((im["url"], os.path.join(img_dir, im["file"])))
+    if not tasks:
+        print("  (无图片)")
+        return 0
+    print(f"\n  下载 {len(tasks)} 张图片 ({workers} 线程, 强制 IPv4)...")
+    ok = 0
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_download_one, u, f): f for u, f in tasks}
+        for done, fut in enumerate(as_completed(futs), 1):
+            r = fut.result()
+            if r.startswith("ok") or r == "skip":
+                ok += 1  # 成功+跳过(计划 Interfaces: 返回 成功+跳过数)
+            elif r.startswith("fail"):
+                print(f"    ⚠️  {os.path.basename(futs[fut])}: {r}")
+            if done % 50 == 0:
+                print(f"    {done}/{len(tasks)}  ({time.time() - t0:.0f}s)")
+    print(f"  ✅ 图片完成 {ok}/{len(tasks)}")
+    return ok
+
+
+def merge_chapters(book_title, book_author, book_dir, md_dir, raw_dir):
+    """按目录序合并选中章节(新格式 raw)为 书名.md, 写在书目录内使 images/ 相对路径可用。"""
+    recs = []
+    if os.path.isdir(raw_dir):
+        for jf in os.listdir(raw_dir):
+            if jf.endswith(".json"):
+                try:
+                    with open(os.path.join(raw_dir, jf), encoding="utf-8") as f:
+                        r = json.load(f)
+                except Exception:
+                    continue
+                if isinstance(r.get("catalog_idx"), int):
+                    recs.append(r)
+    recs.sort(key=lambda r: r["catalog_idx"])
+    out_path = os.path.join(book_dir, sanitize_filename(book_title) + ".md")
+    with open(out_path + ".tmp", "w", encoding="utf-8") as out:
+        out.write(f"# {book_title}\n\n**{book_author}**\n\n---\n\n")
+        for r in recs:
+            md = os.path.join(md_dir, r.get("file", ""))
+            if os.path.exists(md):
+                with open(md, encoding="utf-8") as f:
+                    out.write(f.read())
+                out.write("\n\n---\n\n")
+    os.replace(out_path + ".tmp", out_path)
+    print(f"  📦 合并 {len(recs)} 章 → {out_path}")
+    return out_path
+
+
 # ---------- CLI ----------
 
 def parse_args(argv=None):
@@ -745,16 +923,78 @@ async def main(argv=None):
     print(f"  Book ID: {book_id}")
     os.makedirs(USER_DATA_DIR, exist_ok=True)
     book_dir = os.path.join("output", book_id)
+    md_dir = os.path.join(book_dir, "chapters")
+    raw_dir = os.path.join(book_dir, "raw")
+    img_dir = os.path.join(book_dir, "images")
+    for d in (md_dir, raw_dir, img_dir):
+        os.makedirs(d, exist_ok=True)
     catalog_path = os.path.join(book_dir, "_catalog.json")
-    os.makedirs(book_dir, exist_ok=True)
+    selection_path = os.path.join(book_dir, "_selection.json")
 
+    if args.download_only:
+        download_all_images(raw_dir, img_dir)
+        return
+
+    catalog = load_catalog(catalog_path)
+    if catalog is None:
+        print("\n  首次导出: 打开浏览器扫描完整目录...")
+        catalog = await scan_catalog_session(book_id, catalog_path)
+        print(f"  ✅ 目录共 {len(catalog)} 章")
     if args.scan_only:
-        titles = await scan_catalog_session(book_id, catalog_path)
-        print(f"  ✅ 目录共 {len(titles)} 章 → {catalog_path}")
-        for i, t in enumerate(titles, 1):
+        for i, t in enumerate(catalog, 1):
             print(f"  [{i:4d}] {t}")
         return
-    print("  (完整流程在 Task 5 装配)")
+
+    selected = resolve_selection(args.chapters, selection_path, catalog)
+    book_title = (load_selection(selection_path) or {}).get("book_title", "")
+    book_author = (load_selection(selection_path) or {}).get("book_author", "")
+    save_selection(selection_path, selected, book_title, book_author)
+    print(f"  已选 {len(selected)} 章, 输出目录: {book_dir}")
+    name_map = dedup_filenames(catalog)
+    seen_imgs = load_seen_imgs(raw_dir)
+
+    errors = 0
+    stalled = 0
+    completed = not remaining_work(selected, raw_dir)
+    while not completed:
+        before = len(remaining_work(selected, raw_dir))
+        res = await run_session(book_id, md_dir, raw_dir, catalog, selected,
+                                name_map, seen_imgs)
+        if res["book_title"]:
+            book_title, book_author = res["book_title"], res["book_author"]
+            save_selection(selection_path, selected, book_title, book_author)
+        if res["error"]:
+            errors += 1
+            if errors >= 3:
+                print("\n  ❌ 连续 3 次会话异常, 停止。已导出内容保留, 重新运行可续传。")
+                break
+            print("  10 秒后重开浏览器继续...")
+            await asyncio.sleep(10)
+            continue
+        errors = 0
+        completed = res["completed"]
+        if not completed:
+            if len(remaining_work(selected, raw_dir)) >= before:
+                stalled += 1
+                if stalled >= 2:
+                    stuck = sorted(remaining_work(selected, raw_dir))
+                    print(f"\n  ⏸  连续 {stalled} 次会话无进展, 停止。未导出章节: {stuck}")
+                    break
+            else:
+                stalled = 0
+            print("  3 秒后重开继续...")
+            await asyncio.sleep(3)
+
+    download_all_images(raw_dir, img_dir)
+    merge_chapters(book_title or book_id, book_author, book_dir, md_dir, raw_dir)
+    n_ch = len([f for f in os.listdir(md_dir) if f.endswith(".md")])
+    print("\n" + "=" * 60)
+    if completed:
+        print(f"  ✅ 导出完成!  📖 {book_title or book_id} — {book_author}")
+    else:
+        print("  ⏸  导出未完成, 部分章节已保存。重新运行脚本可从断点续传。")
+    print(f"  📄 {n_ch} 个章节文件, 📦 {book_dir}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
