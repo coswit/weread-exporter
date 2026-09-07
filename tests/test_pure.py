@@ -89,3 +89,60 @@ class TestMatchCatalogTitle:
 
     def test_empty_header(self):
         assert match_catalog_title(self.TITLES, "", 0) is None
+
+
+from export import (split_spread, chars_to_lines, render_chapter_md,
+                    MEASURE_RE, SENTENCE_END)  # noqa: E402
+
+
+def _ch(t, x, y):
+    return {"t": t, "x": x, "y": y}
+
+
+class TestSplitSpread:
+    def test_two_pages_by_y_reset(self):
+        chars = ([_ch(chr(65 + i), 10, 120 + i * 30) for i in range(11)] +
+                 [_ch(chr(97 + i), 10, 130 + i * 30) for i in range(11)])
+        pages = split_spread(chars)
+        assert len(pages) == 2
+        assert pages[0][0]["t"] == "A"
+        assert pages[1][0]["t"] == "a"
+
+    def test_short_stays_single(self):
+        assert len(split_spread([_ch("a", 1, 10)])) == 1
+
+
+class TestCharsToLines:
+    def test_rows_grouped_by_y_and_sorted_by_x(self):
+        chars = [_ch("界", 20, 100), _ch("世", 10, 99), _ch("好", 10, 201), _ch("人", 20, 200)]
+        lines = chars_to_lines(chars)
+        assert [l["text"] for l in lines] == ["世界", "好人"]
+
+    def test_measure_only_dropped(self):
+        assert chars_to_lines([_ch(" .,1", 1, 10)]) == []
+
+
+class TestRenderChapterMd:
+    def test_lines_merged_into_paragraphs(self):
+        blocks = [{"type": "text", "text": "这是第一行没有标点"},
+                  {"type": "text", "text": "接续第二行。"},
+                  {"type": "text", "text": "新段落。"}]
+        body, imgs = render_chapter_md("测试章", blocks, 7)
+        assert "# 测试章" in body
+        assert "这是第一行没有标点接续第二行。" in body
+        assert "新段落。" in body
+        assert imgs == []
+
+    def test_image_breaks_paragraph(self):
+        blocks = [{"type": "text", "text": "段落一。"},
+                  {"type": "img", "src": "http://x/a.jpg", "w": 1, "h": 1},
+                  {"type": "text", "text": "段落二。"}]
+        body, imgs = render_chapter_md("t", blocks, 3)
+        assert "![图](images/ch0003_img01.jpg)" in body
+        assert imgs == [{"url": "http://x/a.jpg", "file": "ch0003_img01.jpg"}]
+
+    def test_title_line_not_repeated_in_body(self):
+        blocks = [{"type": "text", "text": "章节标题"},
+                  {"type": "text", "text": "正文。"}]
+        body, _ = render_chapter_md("章节标题", blocks, 1)
+        assert body.count("章节标题") == 1
