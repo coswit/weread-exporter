@@ -264,3 +264,258 @@ def render_chapter_md(ch_title, blocks, ch_idx):
 
     body = "\n\n".join(out) + "\n"
     return body, img_records
+
+
+def kill_stale_browsers():
+    """清掉仍占用本工具 profile 的残留浏览器进程。
+    浏览器被强关/崩溃后常留下孤儿进程锁住 profile，导致下次 launch 直接失败。"""
+    marker = os.path.abspath(USER_DATA_DIR)
+    try:
+        if sys.platform == "win32":
+            ps_cmd = (
+                "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                "Where-Object {$_.CommandLine -like '*" + marker + "*'} | "
+                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
+                "-ErrorAction SilentlyContinue }"
+            )
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd],
+                           capture_output=True, timeout=30)
+        else:
+            subprocess.run(["pkill", "-f", marker], capture_output=True, timeout=30)
+    except Exception:
+        pass
+
+
+# ---------- 目录浏览器层 ----------
+
+# 目录条目（清理前的原始文本，DOM 序）
+CATALOG_ITEMS_JS = """
+() => Array.from(document.querySelectorAll('.readerCatalog_list_item')).map(el => {
+    const t = el.querySelector('.readerCatalog_list_title');
+    return ((t ? t.textContent : el.textContent) || '').trim();
+}).filter(s => s)
+"""
+
+CATALOG_SCROLL_JS = """
+(delta) => {
+    const sc = document.querySelector('.readerCatalog_list_scroll_area, [class*="readerCatalog_list_scroll"]');
+    if (sc) sc.scrollTop += delta;
+    return sc ? sc.scrollTop : -1;
+}
+"""
+
+CATALOG_BOTTOM_JS = """
+() => {
+    const sc = document.querySelector('.readerCatalog_list_scroll_area, [class*="readerCatalog_list_scroll"]');
+    return !!sc && sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 4;
+}
+"""
+
+CATALOG_TOP_JS = """
+() => {
+    const sc = document.querySelector('.readerCatalog_list_scroll_area, [class*="readerCatalog_list_scroll"]');
+    if (sc) sc.scrollTop = 0;
+}
+"""
+
+
+def locate_slice(titles, visible):
+    """当前渲染切片（虚拟列表只渲染可见窗口）在完整目录中的起始下标。
+    返回最小的 o 使 titles[o:o+len(visible)] == visible；找不到返回 None。"""
+    n = len(visible)
+    if n == 0:
+        return None
+    for o in range(0, len(titles) - n + 1):
+        if titles[o:o + n] == visible:
+            return o
+    return None
+
+
+async def open_catalog_panel(page):
+    await page.click("button.readerControls_item.catalog", timeout=5000)
+    await asyncio.sleep(1.0)
+
+
+async def close_catalog_panel(page):
+    try:
+        await page.click("button.readerControls_item.catalog", timeout=2000)
+    except Exception:
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+    await asyncio.sleep(0.8)
+
+
+async def visible_titles(page):
+    raw = await page.evaluate(CATALOG_ITEMS_JS)
+    out = []
+    for t in raw:
+        c = clean_catalog_title(t)
+        if c:
+            out.append(c)
+    return out
+
+
+async def scan_full_catalog(page):
+    """打开目录面板，小步滚动到底，按序收集全部章节标题（虚拟列表增量渲染）。"""
+    await open_catalog_panel(page)
+    await page.evaluate(CATALOG_TOP_JS)
+    await asyncio.sleep(0.5)
+    known = []
+    stagnant = 0
+    while stagnant < 12:
+        vis = await visible_titles(page)
+        appended = 0
+        if vis:
+            if not known:
+                known = list(vis)
+                appended = len(vis)
+            else:
+                start = locate_slice(known, vis)
+                if start is not None:
+                    tail = start + len(vis)
+                    if tail > len(known):
+                        appended = tail - len(known)
+                        known.extend(vis[len(vis) - appended:])
+        if appended == 0:
+            stagnant += 1
+            if await page.evaluate(CATALOG_BOTTOM_JS):
+                break
+        else:
+            stagnant = 0
+        await page.evaluate(CATALOG_SCROLL_JS, 400)
+        await asyncio.sleep(0.2)
+    await close_catalog_panel(page)
+    return known
+
+
+async def jump_to_chapter(page, target_idx, titles):
+    """打开目录，滚动到第 target_idx（1-based）章条目并点击跳转。失败抛 RuntimeError。"""
+    await open_catalog_panel(page)
+    target_title = titles[target_idx - 1]
+    try:
+        await page.evaluate(CATALOG_TOP_JS)
+        await asyncio.sleep(0.4)
+        for _ in range(800):
+            vis = await visible_titles(page)
+            if vis:
+                start = locate_slice(titles, vis)
+                if start is not None and start <= target_idx - 1 < start + len(vis):
+                    k = target_idx - 1 - start
+                    await page.locator(".readerCatalog_list_item").nth(k).click(timeout=4000)
+                    return
+            await page.evaluate(CATALOG_SCROLL_JS, 300)
+            await asyncio.sleep(0.2)
+        raise RuntimeError(f"目录中定位不到第 {target_idx} 章「{target_title}」")
+    finally:
+        await close_catalog_panel(page)
+        await asyncio.sleep(2.5)
+
+
+async def ensure_login(ctx):
+    login_page = await ctx.new_page()
+    await login_page.goto("https://weread.qq.com/web/shelf", timeout=30000)
+    await asyncio.sleep(3)
+    if "login" in login_page.url.lower():
+        print("\n  ⚠️  请扫码登录微信读书")
+        for _ in range(120):
+            await asyncio.sleep(5)
+            if "login" not in login_page.url.lower():
+                print("  ✅ 登录成功")
+                break
+        else:
+            await login_page.close()
+            raise RuntimeError("登录超时（10 分钟）")
+    else:
+        print("  ✅ 已登录")
+    await login_page.close()
+
+
+async def fetch_book_title(page):
+    info = await page.evaluate("""() => {
+        const title = document.querySelector('.readerCatalog_bookInfo_title_txt, .bookInfo_right_header_title')
+            ?.textContent?.trim() || document.title.replace(/-.*$/, '').trim();
+        const author = document.querySelector('.readerCatalog_bookInfo_author, .bookInfo_author a')
+            ?.textContent?.trim() || '';
+        return {title, author};
+    }""")
+    return info.get("title", "未知"), info.get("author", "")
+
+
+@asynccontextmanager
+async def reader_session(book_id):
+    """打开持久化浏览器 → 确保登录 → 打开阅读器并注入 Canvas Hook → yield page。"""
+    async with async_playwright() as p:
+        kill_stale_browsers()
+        ctx = await p.chromium.launch_persistent_context(
+            USER_DATA_DIR, headless=False, viewport={"width": 1200, "height": 900},
+            args=["--disable-blink-features=AutomationControlled", "--disable-gpu"])
+        try:
+            await ensure_login(ctx)
+            page = await ctx.new_page()
+            await page.add_init_script(CANVAS_HOOK)
+            await page.goto(f"https://weread.qq.com/web/reader/{book_id}",
+                            wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(4)
+            yield page
+            await page.close()
+        finally:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+
+
+async def scan_catalog_session(book_id, catalog_path):
+    async with reader_session(book_id) as page:
+        titles = await scan_full_catalog(page)
+    with open(catalog_path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(titles, f, ensure_ascii=False)
+    os.replace(catalog_path + ".tmp", catalog_path)
+    return titles
+
+
+# ---------- CLI ----------
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(
+        description="weread-exporter v4 — 微信读书导出（选章/标题命名/快速）")
+    ap.add_argument("book", help="reader URL 或 book_id")
+    ap.add_argument("--chapters", default=None,
+                    help='要导出的章节, 如 "5-12,18"（1-based；不传则交互选择/沿用上次）')
+    ap.add_argument("--download-only", action="store_true",
+                    help="只补下 raw 里记录的图片, 不打开浏览器")
+    ap.add_argument("--scan-only", action="store_true",
+                    help="只扫描完整目录存 _catalog.json, 不导出")
+    return ap.parse_args(argv)
+
+
+def extract_book_id(raw):
+    raw = raw.strip().rstrip("/")
+    return raw.split("/")[-1] if "weread.qq.com" in raw else raw
+
+
+async def main(argv=None):
+    args = parse_args(argv)
+    book_id = extract_book_id(args.book)
+    print("=" * 60)
+    print("  weread-exporter v4 — 选章 / 标题命名 / 快速")
+    print("=" * 60)
+    print(f"  Book ID: {book_id}")
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
+    book_dir = os.path.join("output", book_id)
+    catalog_path = os.path.join(book_dir, "_catalog.json")
+    os.makedirs(book_dir, exist_ok=True)
+
+    if args.scan_only:
+        titles = await scan_catalog_session(book_id, catalog_path)
+        print(f"  ✅ 目录共 {len(titles)} 章 → {catalog_path}")
+        for i, t in enumerate(titles, 1):
+            print(f"  [{i:4d}] {t}")
+        return
+    print("  (完整流程在 Task 5 装配)")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

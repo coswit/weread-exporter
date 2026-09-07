@@ -146,3 +146,18 @@ class TestRenderChapterMd:
                   {"type": "text", "text": "正文。"}]
         body, _ = render_chapter_md("章节标题", blocks, 1)
         assert body.count("章节标题") == 1
+
+
+from export import locate_slice  # noqa: E402
+
+
+class TestLocateSlice:
+    def test_overlap_found(self):
+        titles = ["a", "b", "c", "d", "e"]
+        assert locate_slice(titles, ["c", "d"]) == 2
+
+    def test_no_match(self):
+        assert locate_slice(["a", "b"], ["x"]) is None
+
+    def test_full_match_at_zero(self):
+        assert locate_slice(["a", "b"], ["a", "b"]) == 0
