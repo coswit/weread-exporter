@@ -665,6 +665,37 @@ def drop_overlap_blocks(blocks, prev_last_para):
     return committed
 
 
+class _SegmentEnd(Exception):
+    """页内切分命中段外章节时, 用于从捕获流程中跳出本段。"""
+
+
+def heading_match(titles, text, cur_pos, window=2):
+    """画布文字行是否恰为 cur_pos 前方 window 内某个目录标题(去空白全等)。
+    返回命中的目录编号(1-based)或 None。用于页内小节边界检测。"""
+    n = re.sub(r"\s+", "", text or "")
+    if not n:
+        return None
+    for idx in range(cur_pos + 1, min(cur_pos + 1 + window, len(titles) + 1)):
+        if re.sub(r"\s+", "", titles[idx - 1]) == n:
+            return idx
+    return None
+
+
+def trim_to_heading(blocks, title):
+    """丢弃开头块直到命中本章标题行(含该行);先遇到图片或未命中则不裁。
+    返回丢弃的块数。用于跳转/切章后落地页含前一小节内容的裁剪。"""
+    n = re.sub(r"\s+", "", title or "")
+    if not n:
+        return 0
+    for i, b in enumerate(blocks):
+        if b["type"] == "img":
+            return 0
+        if b["type"] == "text" and re.sub(r"\s+", "", b["text"]) == n:
+            del blocks[:i + 1]
+            return i + 1
+    return 0
+
+
 async def export_segment(page, seg, titles, selected, md_dir, raw_dir, name_map, seen_imgs):
     """导出一个连续章节段 seg(1-based 目录编号列表)。返回 (保存章数, 结束原因)。"""
     start, end = seg[0], seg[-1]
@@ -702,16 +733,35 @@ async def export_segment(page, seg, titles, selected, md_dir, raw_dir, name_map,
         blocks.clear()
 
     async def capture_once():
+        nonlocal cur_pos, cur_title
         await asyncio.sleep(0.15)
         chars = await page.evaluate("() => window.__wr_chars")
         rects = await page.evaluate(CANVAS_RECTS_JS)
         imgs = await page.evaluate(VIEWPORT_IMGS_JS)
         added = 0
+        cut = False
         for b in build_page_blocks(chars, imgs, rects, seen_imgs):
             if (b["type"] == "text" and blocks
                     and blocks[-1].get("type") == "text"
                     and blocks[-1]["text"] == b["text"]):
                 continue
+            if not cut and b["type"] == "text":
+                hm = heading_match(titles, b["text"], cur_pos)
+                if hm is not None:
+                    cut = True
+                    if not blocks and cur_pos in selected:
+                        _save_empty_chapter(cur_title, cur_pos, md_dir, raw_dir, name_map)
+                    save_and_clear()
+                    if hm > end or hm not in selected:
+                        # 顶部/画布标题直接跳到段外: 中间被跨过的选中章多为
+                        # 不足一页的小节(内容已并入前一章页面), 记空章防重复导出
+                        for skipped in range(cur_pos + 1, hm):
+                            if skipped in selected:
+                                _save_empty_chapter(titles[skipped - 1], skipped,
+                                                    md_dir, raw_dir, name_map)
+                        raise _SegmentEnd()
+                    cur_pos, cur_title = hm, titles[hm - 1]
+                    continue  # 标题行本身不进正文
             blocks.append(b)
             added += 1
         return added
@@ -720,6 +770,9 @@ async def export_segment(page, seg, titles, selected, md_dir, raw_dir, name_map,
     await page.evaluate("() => window.__wr_reset()")
     await wait_render_stable(page)
     await capture_once()
+    trimmed = trim_to_heading(blocks, cur_title)
+    if trimmed:
+        print(f"  ℹ️  页内定位: 裁去本章标题行前的 {trimmed} 块")
     dropped = drop_overlap_blocks(blocks, prev_last_paragraph(raw_dir, md_dir, start))
     if dropped:
         print(f"  ℹ️  跨界去重: 丢弃与前章末页重复的 {dropped} 行")
@@ -744,9 +797,14 @@ async def export_segment(page, seg, titles, selected, md_dir, raw_dir, name_map,
                         _save_empty_chapter(cur_title, cur_pos, md_dir, raw_dir, name_map)
                     save_and_clear()
                     if m > end or m not in selected:
+                        for skipped in range(cur_pos + 1, m):
+                            if skipped in selected:
+                                _save_empty_chapter(titles[skipped - 1], skipped,
+                                                    md_dir, raw_dir, name_map)
                         return saved[0], "segment_end"
                     cur_pos, cur_title = m, new_title
                     await capture_once()  # 新章首页
+                    trim_to_heading(blocks, cur_title)
                     stale = 0
                     continue
 
@@ -758,6 +816,8 @@ async def export_segment(page, seg, titles, selected, md_dir, raw_dir, name_map,
                     return saved[0], "stale"
             else:
                 stale = 0
+    except _SegmentEnd:
+        return saved[0], "segment_end"
     finally:
         # 异常中断:把已捕获的半章抢救落盘(finished=False, 续传时整章重导)
         if blocks:

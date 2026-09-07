@@ -232,3 +232,41 @@ class TestPrevLastParagraph:
     def test_missing_returns_empty(self, tmp_path):
         assert prev_last_paragraph(str(tmp_path / "raw"), str(tmp_path / "md"), 6) == ""
         assert prev_last_paragraph(str(tmp_path), str(tmp_path), 1) == ""
+
+
+from export import heading_match, trim_to_heading  # noqa: E402
+
+
+class TestHeadingMatch:
+    T = ["扉页", "1.1 系统架构", "1.1.1 Android系统架构", "1.1.2 本书的架构"]
+
+    def test_exact_next(self):
+        assert heading_match(self.T, "1.1.1 Android系统架构", 2) == 3
+
+    def test_whitespace_normalized(self):
+        assert heading_match(self.T, " 1.1  系统架构 ", 1) == 2
+
+    def test_window_limit(self):
+        assert heading_match(self.T, "1.1.2 本书的架构", 1) is None  # 距离 3 超窗
+
+    def test_body_text_no_match(self):
+        assert heading_match(self.T, "Android系统采用分层架构", 1) is None
+
+
+class TestTrimToHeading:
+    def test_trims_up_to_heading_inclusive(self):
+        blocks = [{"type": "text", "text": "上一小节的尾巴"},
+                  {"type": "text", "text": "1.1.1 Android系统架构"},
+                  {"type": "text", "text": "本节正文。"}]
+        assert trim_to_heading(blocks, "1.1.1 Android系统架构") == 2
+        assert [b["text"] for b in blocks] == ["本节正文。"]
+
+    def test_image_first_no_trim(self):
+        blocks = [{"type": "img", "src": "u", "w": 1, "h": 1},
+                  {"type": "text", "text": "1.1 系统架构"}]
+        assert trim_to_heading(blocks, "1.1 系统架构") == 0
+        assert len(blocks) == 2
+
+    def test_no_match_no_trim(self):
+        blocks = [{"type": "text", "text": "正文"}]
+        assert trim_to_heading(blocks, "不存在的标题") == 0
