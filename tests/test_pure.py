@@ -161,3 +161,32 @@ class TestLocateSlice:
 
     def test_full_match_at_zero(self):
         assert locate_slice(["a", "b"], ["a", "b"]) == 0
+
+
+import json
+
+from export import compute_segments, remaining_work  # noqa: E402
+
+
+class TestComputeSegments:
+    def test_splits_runs(self):
+        assert compute_segments({5, 6, 7, 9, 12, 13}) == [[5, 6, 7], [9], [12, 13]]
+
+    def test_empty(self):
+        assert compute_segments(set()) == []
+
+
+class TestRemainingWork:
+    def test_no_raw_dir(self, tmp_path):
+        assert remaining_work({1, 2, 3}, str(tmp_path / "none")) == {1, 2, 3}
+
+    def test_finished_excluded_unfinished_kept(self, tmp_path):
+        raw = tmp_path / "raw"
+        raw.mkdir()
+        (raw / "0001.json").write_text(
+            json.dumps({"catalog_idx": 1, "finished": True}), encoding="utf-8")
+        (raw / "0002.json").write_text(
+            json.dumps({"catalog_idx": 2, "finished": False}), encoding="utf-8")
+        (raw / "old.json").write_text(
+            json.dumps({"title": "旧版无 catalog_idx"}), encoding="utf-8")
+        assert remaining_work({1, 2, 3, 4}, str(raw)) == {2, 3, 4}

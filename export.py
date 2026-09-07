@@ -476,6 +476,246 @@ async def scan_catalog_session(book_id, catalog_path):
     return titles
 
 
+# ---------- 会话导出核心 ----------
+
+async def header_title(page):
+    return await page.evaluate(
+        "() => document.querySelector('.renderTargetPageInfo_header_chapterTitle')"
+        "?.textContent?.trim() || ''")
+
+
+async def wait_render_stable(page, min_elapsed=0.25, poll=0.12, timeout=8.0):
+    """翻页后自适应等待:轮询字符数,连续两次一致且距翻页不少于 min_elapsed 即返回。
+    取代 v3 的固定 sleep(1.0)+0.5s 轮询,典型页耗时约 0.3-0.6s。"""
+    t0 = time.monotonic()
+    last = -1
+    while True:
+        c = await page.evaluate("() => window.__wr_count()")
+        if c == last and (time.monotonic() - t0) >= min_elapsed:
+            return c
+        if time.monotonic() - t0 > timeout:
+            return c
+        last = c
+        await asyncio.sleep(poll)
+
+
+def compute_segments(indices):
+    """选中编号 → 升序连续段列表,每段整段跳转一次。"""
+    segs = []
+    for x in sorted(indices):
+        if segs and x == segs[-1][-1] + 1:
+            segs[-1].append(x)
+        else:
+            segs.append([x])
+    return segs
+
+
+def remaining_work(selected, raw_dir):
+    """选中章中未完成的:无 raw 记录,或 raw 的 finished 不为 true。"""
+    finished = set()
+    if os.path.isdir(raw_dir):
+        for jf in os.listdir(raw_dir):
+            if not jf.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(raw_dir, jf), encoding="utf-8") as f:
+                    r = json.load(f)
+            except Exception:
+                continue
+            if r.get("finished") and isinstance(r.get("catalog_idx"), int):
+                finished.add(r["catalog_idx"])
+    return {i for i in selected if i not in finished}
+
+
+def latest_done_idx(raw_dir):
+    best = 0
+    if os.path.isdir(raw_dir):
+        for jf in os.listdir(raw_dir):
+            if jf.endswith(".json"):
+                try:
+                    with open(os.path.join(raw_dir, jf), encoding="utf-8") as f:
+                        ci = json.load(f).get("catalog_idx")
+                except Exception:
+                    continue
+                if isinstance(ci, int):
+                    best = max(best, ci)
+    return best
+
+
+def load_seen_imgs(raw_dir):
+    seen = set()
+    if os.path.isdir(raw_dir):
+        for jf in os.listdir(raw_dir):
+            if jf.endswith(".json"):
+                try:
+                    with open(os.path.join(raw_dir, jf), encoding="utf-8") as f:
+                        r = json.load(f)
+                except Exception:
+                    continue
+                for im in r.get("images", []):
+                    seen.add(im.get("url"))
+    return seen
+
+
+def purge_stale_chapters(raw_dir, md_dir, remaining, seen_imgs):
+    """删除未完成章节(raw+md)并从 seen_imgs 撤销其图片,重导时从头完整捕获。"""
+    if not os.path.isdir(raw_dir):
+        return
+    for jf in list(os.listdir(raw_dir)):
+        if not jf.endswith(".json"):
+            continue
+        path = os.path.join(raw_dir, jf)
+        try:
+            with open(path, encoding="utf-8") as f:
+                r = json.load(f)
+        except Exception:
+            continue
+        if r.get("catalog_idx") in remaining:
+            md = os.path.join(md_dir, r.get("file", ""))
+            for p in (md, path):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            for im in r.get("images", []):
+                seen_imgs.discard(im.get("url"))
+
+
+def save_chapter(ch_title, blocks, catalog_idx, md_dir, raw_dir, name_map, finished=True):
+    """按标题命名落盘一章:chapters/<标题>.md + raw/<idx>.json(原子写)。"""
+    body, img_records = render_chapter_md(ch_title, blocks, catalog_idx)
+    text_len = sum(len(b["text"]) for b in blocks if b["type"] == "text")
+    if text_len == 0 and not img_records:
+        return 0, []
+    fname = name_map[catalog_idx - 1] + ".md"
+    md_path = os.path.join(md_dir, fname)
+    with open(md_path + ".tmp", "w", encoding="utf-8") as f:
+        f.write(body)
+    os.replace(md_path + ".tmp", md_path)
+    rec = {"title": ch_title, "catalog_idx": catalog_idx, "file": fname,
+           "images": img_records, "text_len": text_len, "finished": finished}
+    raw_path = os.path.join(raw_dir, f"{catalog_idx:04d}.json")
+    with open(raw_path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(rec, f, ensure_ascii=False)
+    os.replace(raw_path + ".tmp", raw_path)
+    return text_len, img_records
+
+
+async def export_segment(page, seg, titles, selected, md_dir, raw_dir, name_map, seen_imgs):
+    """导出一个连续章节段 seg(1-based 目录编号列表)。返回 (保存章数, 结束原因)。"""
+    start, end = seg[0], seg[-1]
+    print(f"  ▶ 段 {start}-{end}: 跳到「{titles[start - 1]}」")
+    await jump_to_chapter(page, start, titles)
+
+    cur_title = await header_title(page)
+    m = match_catalog_title(titles, cur_title, start - 1)
+    if m is None:
+        print(f"  ⚠️  跳转后标题「{cur_title}」与目录第 {start} 章不符, 按该章继续")
+        cur_pos = start
+    else:
+        cur_pos = m
+    blocks = []
+    warned = set()
+    saved = [0]
+
+    def save_and_clear(note="", finished=True):
+        if not blocks:
+            return
+        n, imgs = save_chapter(cur_title, blocks, cur_pos, md_dir, raw_dir,
+                               name_map, finished=finished)
+        if n or imgs:
+            saved[0] += 1
+            img_note = f" +{len(imgs)}图" if imgs else ""
+            print(f"  [{cur_pos:4d}] {cur_title[:36]:36s} {n:6d}字{img_note}{note}")
+        blocks.clear()
+
+    async def capture_once():
+        await asyncio.sleep(0.15)
+        chars = await page.evaluate("() => window.__wr_chars")
+        rects = await page.evaluate(CANVAS_RECTS_JS)
+        imgs = await page.evaluate(VIEWPORT_IMGS_JS)
+        added = 0
+        for b in build_page_blocks(chars, imgs, rects, seen_imgs):
+            if (b["type"] == "text" and blocks
+                    and blocks[-1].get("type") == "text"
+                    and blocks[-1]["text"] == b["text"]):
+                continue
+            blocks.append(b)
+            added += 1
+        return added
+
+    # 首页
+    await page.evaluate("() => window.__wr_reset()")
+    await wait_render_stable(page)
+    await capture_once()
+
+    stale = 0
+    try:
+        while True:
+            await page.evaluate("() => window.__wr_reset()")
+            await page.mouse.click(600, 450)
+            await page.keyboard.press("ArrowRight")
+            await wait_render_stable(page)
+
+            new_title = await header_title(page)
+            if new_title and new_title != cur_title:
+                m = match_catalog_title(titles, new_title, cur_pos)
+                if m is None:
+                    if new_title not in warned:
+                        print(f"  ⚠️  顶部标题「{new_title}」在目录中定位不到, 按同章继续")
+                        warned.add(new_title)
+                else:
+                    save_and_clear()
+                    if m > end or m not in selected:
+                        return saved[0], "segment_end"
+                    cur_pos, cur_title = m, new_title
+                    await capture_once()  # 新章首页
+                    stale = 0
+                    continue
+
+            added = await capture_once()
+            if added == 0:
+                stale += 1
+                if stale >= 10:
+                    save_and_clear(" [连续无新内容, 判定本段结束]")
+                    return saved[0], "stale"
+            else:
+                stale = 0
+    finally:
+        # 异常中断:把已捕获的半章抢救落盘(finished=False, 续传时整章重导)
+        if blocks:
+            save_and_clear("  [中断保存]", finished=False)
+
+
+async def run_session(book_id, md_dir, raw_dir, catalog, selected, name_map, seen_imgs):
+    """一次浏览器会话:打开阅读器→清理未完成章→逐段导出。异常交外层重试。"""
+    res = {"book_title": "", "book_author": "", "error": False, "completed": False}
+    remaining = remaining_work(selected, raw_dir)
+    if not remaining:
+        res["completed"] = True
+        return res
+    purge_stale_chapters(raw_dir, md_dir, remaining, seen_imgs)
+    try:
+        async with reader_session(book_id) as page:
+            res["book_title"], res["book_author"] = await fetch_book_title(page)
+            await page.mouse.click(600, 450)
+            await asyncio.sleep(0.5)
+            segments = compute_segments(remaining)
+            preview = ", ".join(
+                f"{s[0]}-{s[-1]}" if len(s) > 1 else str(s[0]) for s in segments)
+            print(f"  剩余 {len(remaining)} 章, 分 {len(segments)} 段: {preview}")
+            for seg in segments:
+                n, reason = await export_segment(
+                    page, seg, catalog, selected, md_dir, raw_dir, name_map, seen_imgs)
+                print(f"  ✔ 段 {seg[0]}-{seg[-1]}: {n} 章 ({reason})")
+            res["completed"] = not remaining_work(selected, raw_dir)
+    except Exception as e:
+        res["error"] = True
+        first = str(e).splitlines()[0] if str(e) else ""
+        print(f"\n  ⚠️  会话异常中断: {type(e).__name__}: {first[:100]}")
+    return res
+
+
 # ---------- CLI ----------
 
 def parse_args(argv=None):
