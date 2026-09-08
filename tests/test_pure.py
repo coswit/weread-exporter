@@ -309,3 +309,52 @@ class TestCodeBlocks:
     def test_md_code_block_fence_escaping(self):
         out = md_code_block("x = `a`\n```\ny\n")
         assert out == "````\nx = `a`\n```\ny\n````"
+
+
+from export import detect_code_lang, render_chapter_md as _rcm  # noqa: E402
+
+
+class TestDetectCodeLang:
+    def test_from_filename_annotation(self):
+        assert detect_code_lang("x = 1", "[--＞ActivityThread.java]") == "java"
+        assert detect_code_lang("", "[-->test.py]") == "python"
+        assert detect_code_lang("", "见 Foo.kt 中的代码") == "kotlin"
+
+    def test_content_heuristics(self):
+        assert detect_code_lang("public class Foo { }") == "java"
+        assert detect_code_lang("#include <stdio.h>\nstd::string s;") == "cpp"
+        assert detect_code_lang("#include <stdio.h>\nint main(){}") == "c"
+        assert detect_code_lang("def main():\n    self.x = 1") == "python"
+        assert detect_code_lang("#!/bin/bash\ncd /tmp") == "bash"
+        assert detect_code_lang("SELECT * FROM users;") == "sql"
+
+    def test_no_match_empty(self):
+        assert detect_code_lang("一些没有特征的文字") == ""
+        assert detect_code_lang("x = 1", "") == ""
+
+    def test_render_uses_annotation_lang(self):
+        blocks = [{"type": "text", "text": "示："},
+                  {"type": "text", "text": "[--＞ActivityThread.java]"},
+                  {"type": "code", "text": "private final void f() {}\n"}]
+        body, _ = _rcm("章", blocks, 1)
+        assert "```java" in body
+
+    def test_md_code_block_with_lang(self):
+        assert md_code_block("int a;", "java") == "```java\nint a;\n```"
+
+class TestCodeLangInherit:
+    def test_consecutive_block_inherits_lang(self):
+        cont = '        ......' + '\n\n'
+        blocks = [{'type': 'text', 'text': '[--＞Foo.java]'},
+                  {'type': 'code', 'text': 'public class Foo { }'},
+                  {'type': 'code', 'text': cont},  # 无特征的续片段
+                  {'type': 'text', 'text': '说明文字。'},
+                  {'type': 'code', 'text': cont}]  # 隔段, 不继承
+        body, _ = _rcm('章', blocks, 1)
+        fences = [l for l in body.splitlines() if l.startswith('```')]
+        # 首块+续片段共 2 个 java; 隔段后的无特征块不继承
+        assert fences.count('```java') == 2
+
+    def test_custom_type_detected(self):
+        assert detect_code_lang('private final Activity performLaunch() {}') == 'java'
+        assert detect_code_lang('interface IWindowSession {') == 'java'

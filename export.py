@@ -265,12 +265,56 @@ def img_filename(url, ch_idx, seq):
     return f"ch{ch_idx:04d}_img{seq:02d}.{ext}"
 
 
-def md_code_block(text):
-    """代码文本 → Markdown 围栏块；正文含 ``` 时自动加长围栏。"""
+# 代码语言识别: 优先取代码前标注行的文件扩展名(如 [--＞ActivityThread.java]),
+# 否则按内容特征推断; 都不中则不加标识
+_EXT_LANG = {"java": "java", "kt": "kotlin", "cs": "csharp", "c": "c", "h": "c",
+             "cpp": "cpp", "cc": "cpp", "cxx": "cpp", "hpp": "cpp",
+             "py": "python", "js": "javascript", "ts": "typescript",
+             "sh": "bash", "bash": "bash", "zsh": "bash",
+             "xml": "xml", "html": "html", "htm": "html", "css": "css",
+             "json": "json", "yml": "yaml", "yaml": "yaml", "sql": "sql",
+             "go": "go", "rs": "rust", "rb": "ruby", "php": "php",
+             "swift": "swift", "m": "objectivec", "mm": "objectivec",
+             "gradle": "groovy", "mk": "makefile", "lua": "lua",
+             "aidl": "java"}
+
+_FILENAME_RE = re.compile(
+    r"[\w\-./\\]+\.(%s)\b" % "|".join(_EXT_LANG), re.IGNORECASE)
+
+_CONTENT_RULES = [
+    ("java", r"\b(public|private|protected)\s+(static\s+)?(final\s+)?(abstract\s+)?"
+             r"(class|interface|[A-Z]\w*|void|int|long|boolean|String)\b"
+             r"|\binterface\s+[A-Z]\w*|import\s+java\.\w+"),
+    ("cpp", r"#include\s*<(?![\w./]*\.h>)[\w./]+>|\bstd::\w+|\bnamespace\s+\w+"),
+    ("c", r"#include\s*<\w+\.h>"),
+    ("python", r"\bdef\s+\w+\s*\(|\bimport\s+[\w.]+\s*$|\bself\.\w+"),
+    ("bash", r"#!\s*/bin/(ba)?sh|^\s*(sudo|apt(-get)?|yum|brew|pip3?)\s+\w+"),
+    ("javascript", r"\bfunction\s+\w+\s*\(|\b(const|let)\s+\w+\s*=|=>\s*\{"),
+    ("sql", r"\bSELECT\b[\s\S]{0,200}?\bFROM\b"),
+    ("xml", r"<\?xml|</\w+>"),
+    # 兜底: 无访问修饰符的方法签名(final/static 修饰或纯 void 函数), 放最后避免误伤 C
+    ("java", r"\b(final|static)\s+\w+\s+\w+\s*\(|^\s*void\s+[a-z]\w*\s*\("),
+]
+
+
+def detect_code_lang(code, context=""):
+    """推断代码语言: 先看前文标注的文件名扩展名, 再按内容特征。返回语言或空串。"""
+    m = _FILENAME_RE.search(context or "")
+    if m:
+        return _EXT_LANG[m.group(1).lower()]
+    for lang, pat in _CONTENT_RULES:
+        if re.search(pat, code, re.MULTILINE):
+            return lang
+    return ""
+
+
+def md_code_block(text, lang=""):
+    """代码文本 → Markdown 围栏块(可带语言标识)；正文含 ``` 时自动加长围栏。"""
     fence = "```"
     while fence in text:
         fence += "`"
-    return f"{fence}\n{text.rstrip()}\n{fence}"
+    head = fence + (lang or "")
+    return f"{head}\n{text.rstrip()}\n{fence}"
 
 
 def render_chapter_md(ch_title, blocks, ch_idx):
@@ -279,6 +323,7 @@ def render_chapter_md(ch_title, blocks, ch_idx):
     para = []
     img_records = []
     img_seq = 0
+    last_para = [""]
 
     def flush_para():
         nonlocal para
@@ -296,20 +341,33 @@ def render_chapter_md(ch_title, blocks, ch_idx):
         for m in merged:
             if m.strip():
                 out.append(m.strip())
+                last_para[0] = m.strip()
         para = []
 
+    last_lang = [""]
+    prev_was_code = False
     for b in blocks:
         if b["type"] == "text":
             para.append(b["text"])
+            prev_was_code = False
         elif b["type"] == "code":
+            # 代码前的标注行(如 [--＞ActivityThread.java])通常就是未落段的当前段
+            context = "".join(para) if para else last_para[0]
             flush_para()
-            out.append(md_code_block(b["text"]))
+            lang = detect_code_lang(b["text"], context)
+            if not lang and prev_was_code and last_lang[0]:
+                lang = last_lang[0]  # 连续代码片段(书的节选取段)沿用前一块语言
+            if lang:
+                last_lang[0] = lang
+            out.append(md_code_block(b["text"], lang))
+            prev_was_code = True
         else:
             flush_para()
             img_seq += 1
             fname = img_filename(b["src"], ch_idx, img_seq)
             out.append(f"![图](./images/{fname})")
             img_records.append({"url": b["src"], "file": fname})
+            prev_was_code = False
     flush_para()
 
     body = "\n\n".join(out) + "\n"
