@@ -521,22 +521,49 @@ async def jump_to_chapter(page, target_idx, titles):
         await asyncio.sleep(2.5)
 
 
+class FatalExportError(Exception):
+    """不可重试的致命错误(书不存在/无权限), 直接终止而非重开会话。"""
+
+
+async def is_logged_in(ctx, page):
+    """登录态判定: weread 域下有 wr_vid+wr_skey 会话 cookie, 且顶栏无「登录」入口。
+    未登录时书架页不跳转 login URL, 只渲染空书架+登录按钮, 不能只看 URL。"""
+    try:
+        names = {c["name"] for c in await ctx.cookies("https://weread.qq.com")}
+    except Exception:
+        names = set()
+    if not {"wr_vid", "wr_skey"} <= names:
+        return False
+    try:
+        has_login_btn = await page.evaluate(
+            "() => !!document.querySelector('.navBar_link_Login')")
+    except Exception:
+        has_login_btn = False
+    return not has_login_btn
+
+
 async def ensure_login(ctx):
     login_page = await ctx.new_page()
     await login_page.goto("https://weread.qq.com/web/shelf", timeout=30000)
     await asyncio.sleep(3)
-    if "login" in login_page.url.lower():
-        print("\n  ⚠️  请扫码登录微信读书")
-        for _ in range(120):
-            await asyncio.sleep(5)
-            if "login" not in login_page.url.lower():
-                print("  ✅ 登录成功")
-                break
-        else:
-            await login_page.close()
-            raise RuntimeError("登录超时（10 分钟）")
-    else:
+    if await is_logged_in(ctx, login_page):
         print("  ✅ 已登录")
+        await login_page.close()
+        return
+    print("\n  ⚠️  未登录, 请在弹出的页面里扫码登录微信读书(登录后自动继续)")
+    try:  # 自动点出登录二维码弹窗; 失败则用户手动点「登录」
+        await login_page.click(".navBar_link_Login", timeout=3000)
+    except Exception:
+        pass
+    for _ in range(150):
+        await asyncio.sleep(4)
+        if await is_logged_in(ctx, login_page):
+            await asyncio.sleep(2)  # 等会话/书架落定
+            print("  ✅ 登录成功, 继续后续操作")
+            break
+    else:
+        await login_page.close()
+        raise RuntimeError("登录超时（10 分钟）")
     await login_page.close()
 
 
@@ -566,6 +593,11 @@ async def reader_session(book_id):
             await page.goto(f"https://weread.qq.com/web/reader/{book_id}",
                             wait_until="networkidle", timeout=30000)
             await asyncio.sleep(4)
+            if "404" in (await page.title()).strip():
+                raise FatalExportError(
+                    f"书籍打不开(404): {book_id}\n"
+                    "     可能原因: book_id 抄错; 账号无权限; "
+                    "或该本地/私有书不支持网页端阅读")
             yield page
             await page.close()
         finally:
@@ -961,6 +993,8 @@ async def run_session(book_id, md_dir, raw_dir, catalog, selected, name_map, see
                     seen_imgs, seen_codes)
                 print(f"  ✔ 段 {seg[0]}-{seg[-1]}: {n} 章 ({reason})")
             res["completed"] = not remaining_work(selected, raw_dir)
+    except FatalExportError:
+        raise
     except Exception as e:
         res["error"] = True
         first = str(e).splitlines()[0] if str(e) else ""
@@ -1167,7 +1201,11 @@ async def main(argv=None):
     catalog = load_catalog(catalog_path)
     if catalog is None:
         print("\n  首次导出: 打开浏览器扫描完整目录...")
-        catalog = await scan_catalog_session(book_id, catalog_path)
+        try:
+            catalog = await scan_catalog_session(book_id, catalog_path)
+        except (FatalExportError, RuntimeError) as e:
+            print(f"\n  ❌ {e}")
+            return
         print(f"  ✅ 目录共 {len(catalog)} 章")
     if args.scan_only:
         for i, t in enumerate(catalog, 1):
@@ -1187,8 +1225,12 @@ async def main(argv=None):
     completed = not remaining_work(selected, raw_dir)
     while not completed:
         before = len(remaining_work(selected, raw_dir))
-        res = await run_session(book_id, md_dir, raw_dir, catalog, selected,
-                                name_map, seen_imgs)
+        try:
+            res = await run_session(book_id, md_dir, raw_dir, catalog, selected,
+                                    name_map, seen_imgs)
+        except (FatalExportError, RuntimeError) as e:
+            print(f"\n  ❌ {e}")
+            return
         if res["book_title"]:
             book_title, book_author = res["book_title"], res["book_author"]
             save_selection(selection_path, selected, book_title, book_author)
